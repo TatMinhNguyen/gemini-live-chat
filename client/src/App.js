@@ -3,6 +3,7 @@ import { io } from "socket.io-client";
 
 function App() {
   const [recording, setRecording] = useState(false);
+  const [transcripts, setTranscripts] = useState([]);
   const socketRef = useRef(null);
   const recordingContextRef = useRef(null);
   const processorRef = useRef(null);
@@ -45,6 +46,30 @@ function App() {
       }
       source.start(nextStartTimeRef.current);
       nextStartTimeRef.current += buffer.duration;
+    });
+
+    socketRef.current.on("user_transcript", (text) => {
+      setTranscripts((prev) => {
+        const lastMsg = prev[prev.length - 1];
+        if (lastMsg && lastMsg.sender === "User") {
+          const newTranscripts = [...prev];
+          newTranscripts[newTranscripts.length - 1] = { ...lastMsg, text: lastMsg.text + text };
+          return newTranscripts;
+        }
+        return [...prev, { sender: "User", text }];
+      });
+    });
+
+    socketRef.current.on("ai_transcript", (text) => {
+      setTranscripts((prev) => {
+        const lastMsg = prev[prev.length - 1];
+        if (lastMsg && lastMsg.sender === "Gemini") {
+          const newTranscripts = [...prev];
+          newTranscripts[newTranscripts.length - 1] = { ...lastMsg, text: lastMsg.text + text };
+          return newTranscripts;
+        }
+        return [...prev, { sender: "Gemini", text }];
+      });
     });
 
     return () => socketRef.current.disconnect();
@@ -131,6 +156,21 @@ function App() {
       >
         {recording ? "Recording..." : "Click to Talk"}
       </button>
+
+      <div style={{ marginTop: "20px", border: "1px solid #ccc", padding: "10px", height: "400px", overflowY: "auto" }}>
+        {transcripts.map((msg, index) => (
+          <div
+            key={index}
+            style={{
+              textAlign: msg.sender === "User" ? "right" : "left",
+              marginBottom: "10px",
+              color: msg.sender === "User" ? "#007bff" : "#333",
+            }}
+          >
+            <strong>{msg.sender}:</strong> {msg.text}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
