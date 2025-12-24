@@ -4,73 +4,76 @@ import { io } from "socket.io-client";
 function App() {
   const [recording, setRecording] = useState(false);
   const [transcripts, setTranscripts] = useState([]);
+
   const socketRef = useRef(null);
-  const recordingContextRef = useRef(null);
-  const processorRef = useRef(null);
+
   const streamRef = useRef(null);
   const audioContextRef = useRef(null);
+  const workletNodeRef = useRef(null);
+
+  const playbackContextRef = useRef(null);
   const nextStartTimeRef = useRef(0);
 
   const geminiSessionActiveRef = useRef(false);
 
+  /* ================= STOP ================= */
   const stopRecording = useCallback(() => {
-    console.log("stopRecording");
+    console.log("🛑 stopRecording");
+
     setRecording(false);
     geminiSessionActiveRef.current = false;
 
-    if (socketRef.current?.connected) {
-      socketRef.current.emit("stop-gemini-session");
+    socketRef.current?.emit("stop-gemini-session");
+
+    if (workletNodeRef.current) {
+      workletNodeRef.current.disconnect();
+      workletNodeRef.current = null;
     }
 
-    if (processorRef.current) {
-      processorRef.current.disconnect();
-      processorRef.current = null;
+    if (audioContextRef.current) {
+      audioContextRef.current.close();
+      audioContextRef.current = null;
     }
-    if (recordingContextRef.current) {
-      recordingContextRef.current.close();
-      recordingContextRef.current = null;
-    }
+
     if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     }
   }, []);
 
+  /* ================= SOCKET ================= */
   useEffect(() => {
     socketRef.current = io("http://localhost:8080");
 
-    // Setup Web Audio API
-    audioContextRef.current = new (window.AudioContext ||
-      window.webkitAudioContext)();
+    // AudioContext để PHÁT tiếng Gemini
+    playbackContextRef.current = new AudioContext();
 
     socketRef.current.on("audio", async (chunk) => {
-      const arrayBuffer = (await chunk.arrayBuffer?.()) || chunk;
+      const buffer = chunk instanceof ArrayBuffer ? chunk : await chunk.arrayBuffer();
+      const ctx = playbackContextRef.current;
+      if (!ctx) return;
 
-      const audioCtx = audioContextRef.current;
-      if (!audioCtx) return;
-
-      // 1. Chuyển đổi PCM Int16 (từ Gemini) sang Float32 (cho Web Audio)
-      const int16Data = new Int16Array(arrayBuffer);
-      const float32Data = new Float32Array(int16Data.length);
-      for (let i = 0; i < int16Data.length; i++) {
-        float32Data[i] = int16Data[i] / 32768.0;
+      // PCM Int16 → Float32
+      const int16 = new Int16Array(buffer);
+      const float32 = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) {
+        float32[i] = int16[i] / 32768;
       }
 
-      // 2. Tạo AudioBuffer (Gemini 2.0 thường trả về 24000Hz)
-      const buffer = audioCtx.createBuffer(1, float32Data.length, 24000);
-      buffer.getChannelData(0).set(float32Data);
+      // Gemini trả về ~24000Hz
+      const audioBuffer = ctx.createBuffer(1, float32.length, 24000);
+      audioBuffer.getChannelData(0).set(float32);
 
-      // 3. Phát âm thanh nối tiếp nhau (tránh bị chồng chéo hoặc ngắt quãng)
-      const source = audioCtx.createBufferSource();
-      source.buffer = buffer;
-      source.connect(audioCtx.destination);
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(ctx.destination);
 
-      const currentTime = audioCtx.currentTime;
-      if (nextStartTimeRef.current < currentTime) {
-        nextStartTimeRef.current = currentTime;
+      if (nextStartTimeRef.current < ctx.currentTime) {
+        nextStartTimeRef.current = ctx.currentTime;
       }
+
       source.start(nextStartTimeRef.current);
-      nextStartTimeRef.current += buffer.duration;
+      nextStartTimeRef.current += audioBuffer.duration;
     });
 
     socketRef.current.on("user_transcript", (text) => {
@@ -98,98 +101,86 @@ function App() {
     });
 
     socketRef.current.on("gemini-session-started", () => {
-      console.log("Gemini session has started.");
+      console.log("✅ Gemini session started");
       geminiSessionActiveRef.current = true;
     });
 
-    socketRef.current.on("gemini-session-error", (error) => {
-      console.error("Gemini session error:", error);
-      alert(error);
+    socketRef.current.on("gemini-session-error", (err) => {
+      alert(err);
       stopRecording();
     });
 
     return () => socketRef.current.disconnect();
   }, [stopRecording]);
 
+  /* ================= START ================= */
   const startRecording = async () => {
-    console.log("startRecording");
+    console.log("🎙 startRecording");
+
     setRecording(true);
     socketRef.current.emit("start-gemini-session");
 
     try {
+      // 🎤 Microphone
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
-      // Khởi tạo AudioContext với sampleRate 16000Hz (chuẩn của Gemini)
-      const context = new (window.AudioContext || window.webkitAudioContext)({
-        sampleRate: 16000,
-      });
-      recordingContextRef.current = context;
+      // AudioContext cho GHI (16kHz – Gemini yêu cầu)
+      const ctx = new AudioContext({ sampleRate: 16000 });
+      audioContextRef.current = ctx;
 
-      const source = context.createMediaStreamSource(stream);
-      // Sử dụng ScriptProcessor để lấy dữ liệu raw
-      const processor = context.createScriptProcessor(4096, 1, 1);
-      processorRef.current = processor;
+      // 🔥 Load AudioWorklet
+      await ctx.audioWorklet.addModule("/pcm-processor.js");
 
-      processor.onaudioprocess = (e) => {
+      const source = ctx.createMediaStreamSource(stream);
+
+      const workletNode = new AudioWorkletNode(ctx, "pcm-processor");
+      workletNodeRef.current = workletNode;
+
+      // Nhận PCM từ worklet → gửi server
+      workletNode.port.onmessage = (e) => {
         if (!geminiSessionActiveRef.current) return;
-
-        const inputData = e.inputBuffer.getChannelData(0);
-
-        // Tính toán âm lượng trung bình (RMS) để debug
-        let sum = 0;
-        for (let i = 0; i < inputData.length; i++) {
-          sum += inputData[i] * inputData[i];
-        }
-        const rms = Math.sqrt(sum / inputData.length);
-        if (rms > 0.01) {
-          console.log("🔊 Volume:", rms.toFixed(4));
-        }
-
-        // Chuyển đổi Float32 (Web Audio) sang Int16 (PCM)
-        const pcmData = new Int16Array(inputData.length);
-        for (let i = 0; i < inputData.length; i++) {
-          const s = Math.max(-1, Math.min(1, inputData[i]));
-          pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-        }
-        socketRef.current.emit("audio", pcmData.buffer);
+        socketRef.current.emit("audio", e.data);
       };
 
-      source.connect(processor);
-      processor.connect(context.destination);
+      source.connect(workletNode);
     } catch (err) {
-      console.error("Lỗi khởi tạo ghi âm:", err);
+      console.error("❌ startRecording error:", err);
       stopRecording();
     }
   };
 
+  /* ================= UI ================= */
   return (
-    <div style={{ padding: "20px" }}>
-      <h1>Push-to-Talk Voice Chat with Gemini</h1>
+    <div style={{ padding: 20 }}>
+      <h1>Gemini Voice Chat (AudioWorklet)</h1>
+
       <button
-        onClick={() => {
-          if (recording) {
-            stopRecording();
-          } else {
-            startRecording();
-          }
-        }}
-        style={{ padding: "20px", fontSize: "16px" }}
+        onClick={() => (recording ? stopRecording() : startRecording())}
+        style={{ padding: 20, fontSize: 16 }}
       >
         {recording ? "Recording..." : "Click to Talk"}
       </button>
 
-      <div style={{ marginTop: "20px", border: "1px solid #ccc", padding: "10px", height: "400px", overflowY: "auto" }}>
-        {transcripts.map((msg, index) => (
+      <div
+        style={{
+          marginTop: 20,
+          border: "1px solid #ccc",
+          padding: 10,
+          height: 400,
+          overflowY: "auto",
+        }}
+      >
+        {transcripts.map((m, i) => (
           <div
-            key={index}
+            key={i}
             style={{
-              textAlign: msg.sender === "User" ? "right" : "left",
-              marginBottom: "10px",
-              color: msg.sender === "User" ? "#007bff" : "#333",
+              textAlign: m.sender === "User" ? "right" : "left",
+              color: m.sender === "User" ? "#007bff" : "#333",
+              marginBottom: 8,
             }}
           >
-            <strong>{msg.sender}:</strong> {msg.text}
+            <b>{m.sender}:</b> {m.text}
           </div>
         ))}
       </div>
