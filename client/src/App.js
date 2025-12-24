@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { io } from "socket.io-client";
 
 function App() {
@@ -10,6 +10,31 @@ function App() {
   const streamRef = useRef(null);
   const audioContextRef = useRef(null);
   const nextStartTimeRef = useRef(0);
+
+  const geminiSessionActiveRef = useRef(false);
+
+  const stopRecording = useCallback(() => {
+    console.log("stopRecording");
+    setRecording(false);
+    geminiSessionActiveRef.current = false;
+
+    if (socketRef.current?.connected) {
+      socketRef.current.emit("stop-gemini-session");
+    }
+
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
+    if (recordingContextRef.current) {
+      recordingContextRef.current.close();
+      recordingContextRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
+  }, []);
 
   useEffect(() => {
     socketRef.current = io("http://localhost:8080");
@@ -72,12 +97,24 @@ function App() {
       });
     });
 
+    socketRef.current.on("gemini-session-started", () => {
+      console.log("Gemini session has started.");
+      geminiSessionActiveRef.current = true;
+    });
+
+    socketRef.current.on("gemini-session-error", (error) => {
+      console.error("Gemini session error:", error);
+      alert(error);
+      stopRecording();
+    });
+
     return () => socketRef.current.disconnect();
-  }, []);
+  }, [stopRecording]);
 
   const startRecording = async () => {
     console.log("startRecording");
     setRecording(true);
+    socketRef.current.emit("start-gemini-session");
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -95,6 +132,8 @@ function App() {
       processorRef.current = processor;
 
       processor.onaudioprocess = (e) => {
+        if (!geminiSessionActiveRef.current) return;
+
         const inputData = e.inputBuffer.getChannelData(0);
 
         // Tính toán âm lượng trung bình (RMS) để debug
@@ -120,24 +159,7 @@ function App() {
       processor.connect(context.destination);
     } catch (err) {
       console.error("Lỗi khởi tạo ghi âm:", err);
-    }
-  };
-
-  const stopRecording = () => {
-    console.log("stopRecording");
-    setRecording(false);
-
-    if (processorRef.current) {
-      processorRef.current.disconnect();
-      processorRef.current = null;
-    }
-    if (recordingContextRef.current) {
-      recordingContextRef.current.close();
-      recordingContextRef.current = null;
-    }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
+      stopRecording();
     }
   };
 
