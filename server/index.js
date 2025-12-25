@@ -3,10 +3,7 @@ import http from "http";
 import { GoogleGenAI, Modality } from "@google/genai";
 import dotenv from "dotenv";
 import PromptText from "./prompt.js";
-
-import pkg from "wavefile";
-const { WaveFile } = pkg;
-import fs from "fs";
+import { createAudioSessionFile } from "./createAudioSessionFile.js";
 
 dotenv.config();
 
@@ -20,19 +17,12 @@ const ai = new GoogleGenAI({
   httpOptions: { apiVersion: "v1alpha" },
 });
 
-function saveWav(filename, pcmBuffers, sampleRate) {
-  const wav = new WaveFile();
-  const pcm = Buffer.concat(pcmBuffers);
-
-  wav.fromScratch(1, sampleRate, "16", pcm);
-  fs.writeFileSync(filename, wav.toBuffer());
-}
-
 io.on("connection", (socket) => {
   console.log("Client connected:", socket.id);
   let session;
   let userAudioBuffers = [];
   let aiAudioBuffers = [];
+  let silenceCount = 0;
 
   socket.on("start-gemini-session", async () => {
     console.log("Starting Gemini session for:", socket.id);
@@ -66,7 +56,7 @@ io.on("connection", (socket) => {
             console.log("Connected to Gemini Live API");
             socket.emit("gemini-session-started");
           },
-          onmessage: (msg) => {
+          onmessage: async (msg) => {
             if (msg.serverContent?.inputTranscription?.text) {
               const userText = msg.serverContent.inputTranscription.text;
               socket.emit("user_transcript", userText);
@@ -91,17 +81,50 @@ io.on("connection", (socket) => {
             }
 
             if (msg.serverContent?.turnComplete) {
-              saveWav(
-                `records/user-${Date.now()}.wav`,
-                userAudioBuffers,
-                16000
-              );
+              console.log("Turn complete ✅ – saving audio");
 
-              saveWav(`records/ai-${Date.now()}.wav`, aiAudioBuffers, 24000);
+              try {
+                // 🔹 Lưu audio user
+                const userAudioResult = await createAudioSessionFile({
+                  audioChunks: userAudioBuffers,
+                  userId: socket.id, // hoặc userId thật
+                  baseOutputFileName: `user_${socket.id}_${Date.now()}`,
+                  clientAudioFormat: {
+                    sampleRate: 16000,
+                    channels: 1,
+                    bitDepth: 16,
+                  },
+                  storageFolder: "records",
+                });
 
-              userAudioBuffers = [];
-              aiAudioBuffers = [];
-              console.log("Turn complete ✅");
+                // 🔹 Lưu audio AI
+                const aiAudioResult = await createAudioSessionFile({
+                  audioChunks: aiAudioBuffers,
+                  userId: "ai",
+                  baseOutputFileName: `ai_${socket.id}_${Date.now()}`,
+                  clientAudioFormat: {
+                    sampleRate: 24000, // Gemini audio output
+                    channels: 1,
+                    bitDepth: 16,
+                  },
+                  storageFolder: "records",
+                });
+
+                console.log("User audio saved:", userAudioResult);
+                console.log("AI audio saved:", aiAudioResult);
+
+                // socket.emit("audio_saved", {
+                //   userAudio: userAudioResult,
+                //   aiAudio: aiAudioResult,
+                // });
+              } catch (err) {
+                console.error("Error saving audio:", err);
+                socket.emit("audio_save_error", "Failed to save audio");
+              } finally {
+                userAudioBuffers = [];
+                aiAudioBuffers = [];
+                silenceCount = 0;
+              }
             }
           },
           onerror: (err) => console.error("Gemini error:", err),
@@ -126,11 +149,34 @@ io.on("connection", (socket) => {
   });
 
   socket.on("audio", (chunk) => {
-    userAudioBuffers.push(Buffer.from(chunk));
+    const bufferChunk = Buffer.from(chunk);
+
+    // Tính toán năng lượng âm thanh (RMS) để lọc khoảng lặng
+    const int16Data = new Int16Array(
+      bufferChunk.buffer,
+      bufferChunk.byteOffset,
+      bufferChunk.length / 2
+    );
+    let sum = 0;
+    for (let i = 0; i < int16Data.length; i++) {
+      const sample = int16Data[i] / 32768.0;
+      sum += sample * sample;
+    }
+    const rms = Math.sqrt(sum / int16Data.length);
+
+    // Chỉ lưu vào buffer nếu có tiếng nói (RMS > 0.02) hoặc giữ lại một chút đuôi (silenceCount < 5)
+    if (rms > 0.01) {
+      silenceCount = 0;
+      userAudioBuffers.push(bufferChunk);
+    } else if (userAudioBuffers.length > 0 && silenceCount < 10) {
+      userAudioBuffers.push(bufferChunk);
+      silenceCount++;
+    }
+
     if (session) {
       session.sendRealtimeInput({
         audio: {
-          data: Buffer.from(chunk).toString("base64"),
+          data: bufferChunk.toString("base64"),
           mimeType: "audio/pcm;rate=16000",
         },
       });
